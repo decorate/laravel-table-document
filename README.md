@@ -16,7 +16,6 @@ Laravelアプリケーションのデータベーステーブル定義書を自�
 
 - PHP 8.1以上
 - Laravel 10.0以上
-- Doctrine DBAL 3.0以上
 
 ## インストール
 
@@ -139,6 +138,12 @@ settings:
       logical_name: 更新日時
       description: レコードが最後に更新された日時
 ```
+
+## Migrationの書き方
+
+より充実した定義書を生成するためのMigrationファイルの書き方は以下を参照してください。
+
+- [Migrationファイルの書き方ガイド](documents/exsample.md)
 
 ## ライセンス
 
