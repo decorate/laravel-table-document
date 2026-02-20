@@ -4,7 +4,6 @@ namespace Decorate\LaravelTableDocument\Services;
 
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
-use Illuminate\Support\Facades\Schema;
 
 class TableDocumentService
 {
@@ -229,50 +228,59 @@ class TableDocumentService
      */
     private function getColumnsInfo(string $tableName): array
     {
-        $columns = Schema::getColumnListing($tableName);
+        $results = DB::select('
+            SELECT
+                COLUMN_NAME,
+                DATA_TYPE,
+                COLUMN_TYPE,
+                IS_NULLABLE,
+                COLUMN_DEFAULT,
+                COLUMN_COMMENT,
+                CHARACTER_MAXIMUM_LENGTH,
+                NUMERIC_PRECISION,
+                NUMERIC_SCALE,
+                EXTRA
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = ?
+            AND TABLE_NAME = ?
+            ORDER BY ORDINAL_POSITION
+        ', [env('DB_DATABASE'), $tableName]);
+
         $columnsInfo = [];
 
-        foreach ($columns as $columnName) {
-            try {
-                $column = DB::connection()->getDoctrineColumn($tableName, $columnName);
+        foreach ($results as $column) {
+            $type = $column->DATA_TYPE;
+            if (strpos($column->COLUMN_TYPE, 'enum') === 0) {
+                $type = 'enum';
+            } elseif (strpos($column->COLUMN_TYPE, 'set') === 0) {
+                $type = 'set';
+            }
 
-                $columnInfo = [
-                    'name' => $columnName,
-                    'type' => $column->getType()->getName(),
-                    'length' => $column->getLength(),
-                    'precision' => $column->getPrecision(),
-                    'scale' => $column->getScale(),
-                    'unsigned' => $column->getUnsigned(),
-                    'nullable' => ! $column->getNotNull(),
-                    'default' => $column->getDefault(),
-                    'comment' => $column->getComment(),
-                    'auto_increment' => $column->getAutoincrement(),
-                    'enum_values' => null,
-                    'constraints' => [],
-                ];
+            $columnInfo = [
+                'name' => $column->COLUMN_NAME,
+                'type' => $type,
+                'length' => $column->CHARACTER_MAXIMUM_LENGTH,
+                'precision' => $column->NUMERIC_PRECISION,
+                'scale' => $column->NUMERIC_SCALE,
+                'unsigned' => strpos($column->COLUMN_TYPE, 'unsigned') !== false,
+                'nullable' => $column->IS_NULLABLE === 'YES',
+                'default' => $column->COLUMN_DEFAULT,
+                'comment' => $column->COLUMN_COMMENT,
+                'auto_increment' => strpos($column->EXTRA, 'auto_increment') !== false,
+                'enum_values' => null,
+                'constraints' => [],
+            ];
 
-                // ENUM型の値を取得
-                if ($column->getType()->getName() === 'enum' || $column->getType()->getName() === 'simple_array') {
-                    $enumValues = $this->getEnumValues($tableName, $columnName);
-                    if (! empty($enumValues)) {
-                        $columnInfo['enum_values'] = $enumValues;
-                    }
-                }
-            } catch (\Exception $e) {
-                // Doctrine DBALでエラーが発生した場合は、直接SQLで情報を取得
-                $columnInfo = $this->getColumnInfoDirectly($tableName, $columnName);
-
-                // ENUM型の値を取得
-                if ($columnInfo['type'] === 'enum') {
-                    $enumValues = $this->getEnumValues($tableName, $columnName);
-                    if (! empty($enumValues)) {
-                        $columnInfo['enum_values'] = $enumValues;
-                    }
+            // ENUM/SET型の値を取得
+            if ($type === 'enum' || $type === 'set') {
+                $enumValues = $this->getEnumValues($tableName, $column->COLUMN_NAME);
+                if (! empty($enumValues)) {
+                    $columnInfo['enum_values'] = $enumValues;
                 }
             }
 
             // CHECK制約を取得（最大値・最小値など）
-            $constraints = $this->getColumnConstraints($tableName, $columnName);
+            $constraints = $this->getColumnConstraints($tableName, $column->COLUMN_NAME);
             if (! empty($constraints)) {
                 $columnInfo['constraints'] = $constraints;
             }
@@ -449,15 +457,31 @@ class TableDocumentService
      */
     private function getIndexesInfo(string $tableName): array
     {
-        $indexes = DB::connection()->getDoctrineSchemaManager()->listTableIndexes($tableName);
-        $indexesInfo = [];
+        $rows = DB::select('
+            SELECT
+                INDEX_NAME,
+                COLUMN_NAME,
+                NON_UNIQUE,
+                SEQ_IN_INDEX
+            FROM INFORMATION_SCHEMA.STATISTICS
+            WHERE TABLE_SCHEMA = ?
+            AND TABLE_NAME = ?
+            ORDER BY INDEX_NAME, SEQ_IN_INDEX
+        ', [env('DB_DATABASE'), $tableName]);
 
-        foreach ($indexes as $index) {
+        $grouped = [];
+        foreach ($rows as $row) {
+            $grouped[$row->INDEX_NAME]['columns'][] = $row->COLUMN_NAME;
+            $grouped[$row->INDEX_NAME]['non_unique'] = $row->NON_UNIQUE;
+        }
+
+        $indexesInfo = [];
+        foreach ($grouped as $indexName => $data) {
             $indexesInfo[] = [
-                'name' => $index->getName(),
-                'columns' => $index->getColumns(),
-                'is_unique' => $index->isUnique(),
-                'is_primary' => $index->isPrimary(),
+                'name' => $indexName,
+                'columns' => $data['columns'],
+                'is_unique' => $data['non_unique'] == 0,
+                'is_primary' => $indexName === 'PRIMARY',
             ];
         }
 
@@ -469,21 +493,42 @@ class TableDocumentService
      */
     private function getForeignKeysInfo(string $tableName): array
     {
-        $foreignKeys = DB::connection()->getDoctrineSchemaManager()->listTableForeignKeys($tableName);
-        $foreignKeysInfo = [];
+        $rows = DB::select('
+            SELECT
+                kcu.CONSTRAINT_NAME,
+                kcu.COLUMN_NAME,
+                kcu.REFERENCED_TABLE_NAME,
+                kcu.REFERENCED_COLUMN_NAME,
+                rc.DELETE_RULE,
+                rc.UPDATE_RULE
+            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+            JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+                ON kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
+                AND kcu.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA
+            WHERE kcu.TABLE_SCHEMA = ?
+            AND kcu.TABLE_NAME = ?
+            AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
+            ORDER BY kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION
+        ', [env('DB_DATABASE'), $tableName]);
 
-        foreach ($foreignKeys as $foreignKey) {
-            $foreignKeysInfo[] = [
-                'name' => $foreignKey->getName(),
-                'columns' => $foreignKey->getLocalColumns(),
-                'foreign_table' => $foreignKey->getForeignTableName(),
-                'foreign_columns' => $foreignKey->getForeignColumns(),
-                'on_delete' => $foreignKey->getOption('onDelete'),
-                'on_update' => $foreignKey->getOption('onUpdate'),
-            ];
+        $grouped = [];
+        foreach ($rows as $row) {
+            $name = $row->CONSTRAINT_NAME;
+            if (! isset($grouped[$name])) {
+                $grouped[$name] = [
+                    'name' => $name,
+                    'columns' => [],
+                    'foreign_table' => $row->REFERENCED_TABLE_NAME,
+                    'foreign_columns' => [],
+                    'on_delete' => $row->DELETE_RULE,
+                    'on_update' => $row->UPDATE_RULE,
+                ];
+            }
+            $grouped[$name]['columns'][] = $row->COLUMN_NAME;
+            $grouped[$name]['foreign_columns'][] = $row->REFERENCED_COLUMN_NAME;
         }
 
-        return $foreignKeysInfo;
+        return array_values($grouped);
     }
 
     /**
@@ -491,15 +536,20 @@ class TableDocumentService
      */
     private function getPrimaryKey(string $tableName): ?array
     {
-        $indexes = DB::connection()->getDoctrineSchemaManager()->listTableIndexes($tableName);
+        $rows = DB::select('
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.STATISTICS
+            WHERE TABLE_SCHEMA = ?
+            AND TABLE_NAME = ?
+            AND INDEX_NAME = \'PRIMARY\'
+            ORDER BY SEQ_IN_INDEX
+        ', [env('DB_DATABASE'), $tableName]);
 
-        foreach ($indexes as $index) {
-            if ($index->isPrimary()) {
-                return $index->getColumns();
-            }
+        if (empty($rows)) {
+            return null;
         }
 
-        return null;
+        return array_map(fn ($row) => $row->COLUMN_NAME, $rows);
     }
 
     /**
@@ -544,51 +594,4 @@ class TableDocumentService
         return $result[0]->table_collation ?? null;
     }
 
-    private function getColumnInfoDirectly(string $tableName, string $columnName): array
-    {
-        $result = DB::select('
-        SELECT
-            COLUMN_NAME,
-            DATA_TYPE,
-            COLUMN_TYPE,
-            IS_NULLABLE,
-            COLUMN_DEFAULT,
-            COLUMN_COMMENT,
-            CHARACTER_MAXIMUM_LENGTH,
-            NUMERIC_PRECISION,
-            NUMERIC_SCALE,
-            EXTRA
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = ?
-        AND TABLE_NAME = ?
-        AND COLUMN_NAME = ?
-    ', [env('DB_DATABASE'), $tableName, $columnName]);
-
-        if (empty($result)) {
-            throw new \Exception("Column not found: {$tableName}.{$columnName}");
-        }
-
-        $column = $result[0];
-
-        // データ型の判定
-        $type = $column->DATA_TYPE;
-        if ($type === 'enum' || strpos($column->COLUMN_TYPE, 'enum') === 0) {
-            $type = 'enum';
-        }
-
-        return [
-            'name' => $column->COLUMN_NAME,
-            'type' => $type,
-            'length' => $column->CHARACTER_MAXIMUM_LENGTH,
-            'precision' => $column->NUMERIC_PRECISION,
-            'scale' => $column->NUMERIC_SCALE,
-            'unsigned' => strpos($column->COLUMN_TYPE, 'unsigned') !== false,
-            'nullable' => $column->IS_NULLABLE === 'YES',
-            'default' => $column->COLUMN_DEFAULT,
-            'comment' => $column->COLUMN_COMMENT,
-            'auto_increment' => strpos($column->EXTRA, 'auto_increment') !== false,
-            'enum_values' => null,
-            'constraints' => [],
-        ];
-    }
 }
